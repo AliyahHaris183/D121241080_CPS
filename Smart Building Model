@@ -1,0 +1,357 @@
+"""
+BlueWave - Simulasi terintegrasi untuk seluruh sensor dan loop kendali
+Cakupan:
+  Kolam (5 unit)  : klorin (A), pH (A), kekeruhan (A), suhu air (B), level air (C)
+  Udara indoor    : suhu dan kelembapan, ventilasi (D, kipas, tirai)
+  Cahaya          : tingkat cahaya, lampu, tirai (L)
+  Sauna (2 unit)  : suhu sauna dengan histeresis (T)
+  Hunian          : jumlah orang dan gerbang (E, F, G)
+  Keselamatan     : alarm gempa, sirene, pintu darurat (Q, G, S, X)
+  Energi          : meter daya dan energi (M)
+  Jaringan        : tunda sensor dan ketersediaan Wi-Fi 6 (W, H)
+Metode : Euler, dt = 60 s, simulasi 7 hari
+Catatan: parameter adalah contoh (bukan hasil kalibrasi terhadap data sensor).
+"""
+import math
+from collections import deque
+
+import numpy as np
+
+# ============ 1. Konstanta umum ============
+DT = 60.0                          # langkah waktu [s]
+DAYS = 7                           # panjang simulasi [hari]
+N_STEPS = DAYS * 86400 // int(DT)  # jumlah langkah
+DELAY = 120.0                      # tunda sensor + jaringan [s]
+L_DELAY = int(DELAY / DT)          # panjang buffer tunda (langkah)
+P_ATM = 101325.0                   # tekanan atmosfer [Pa]
+
+RHO, CP, LV = 1000.0, 4180.0, 2.45e6   # air: massa jenis, kalor jenis, kalor laten [SI]
+HC = 10.0                          # koefisien perpindahan panas permukaan [W/m2/K]
+TM = 27.0                          # suhu air segar [C]
+QM_MAX = 0.01                      # debit maks valve air segar [m3/s]
+CW = 1.5                           # koefisien limpasan weir [m^0.5/s]
+
+CD = 2.0e4                         # konsentrasi larutan dosing klorin [mg/L]
+KR = 2.0e-6                        # peluruhan klorin [1/s]
+BETA = 1.0e-7                      # konsumsi klorin per perenang [mg/L/s]
+CSP = 2.0                          # setpoint klorin [mg/L]
+QD_MAX_REF = 5e-6                  # debit maks pompa dosing untuk V = 1250 m3 [m3/s]
+KA, KPH, PH0 = 2e-4, 1e-5, 7.8     # pH: gain dosing, peluruhan ke pH alami, pH alami
+PH_SP = 7.5                        # setpoint pH
+SIGMA_K = 4e-7                     # produksi kekeruhan per perenang [NTU/s]
+K_FILTER = 4.6e-5                  # laju penyaringan filter [1/s] (turnover ~6 jam)
+PH_MAX_PER_M2 = 300.0              # daya pemanas maks per m2 permukaan air [W/m2]
+
+F_EVAP_A, F_EVAP_B = 4e-8, 1e-8    # f(v) = a + b*v  [kg/(s*m2*Pa)]
+V_WIND = 0.1                       # kecepatan udara di atas air [m/s]
+
+M_AIR = 9000.0                     # massa udara indoor [kg]
+CPA = 1005.0                       # kalor jenis udara [J/kg/K]
+ALPHA_P = 90.0                     # panas sensibel per perenang [W]
+MDOT_BASE, MDOT_FAN = 2.0, 8.0     # ventilasi dasar dan tambahan kipas [kg/s]
+FAN_W = 800.0                      # daya kipas per kg/s ventilasi [W]
+
+TAU_L = 600.0                      # waktu tanggap cahaya [s]
+TR = 0.005                         # transmisi cahaya matahari ke dalam
+E_SUN_PEAK = 50000.0               # cahaya matahari puncak [lux]
+TIRAI_CLOSE = 40000.0              # tirai menutup jika cahaya matahari di atas ini [lux]
+LAMP_LUX = 300.0                   # cahaya lampu penuh [lux]
+LAMP_ON, LAMP_OFF = 150.0, 250.0   # histeresis lampu [lux]
+P_LAMP = 2000.0                    # daya lampu penuh [W]
+QL_FRAC = 0.3                      # bagian daya lampu menjadi panas
+
+C_S, P_S, UA_S = 3e5, 6000.0, 60.0 # sauna: kapasitas termal [J/K], daya [W], konduktansi [W/K]
+SAUNA_TMIN, SAUNA_TMAX = 70.0, 80.0
+
+LAMBDA_BUSY, LAMBDA_OFF = 0.02, 0.004  # laju masuk [orang/s] jam sibuk dan sepi
+TAU_STAY = 5400.0                  # rata-rata lama tinggal [s]
+N_MAX = 200                        # kapasitas maksimum area kolam [orang]
+
+P_PUMP, P_CTRL = 4000.0, 500.0     # daya pompa sirkulasi dan controller [W]
+
+ALARM_DAY, ALARM_HOUR = 3, 10.0    # skenario gempa: hari ke-3 pukul 10.00
+ALARM_DUR = 60.0                   # durasi getaran [s]
+AG_EVENT, AG_TH = 0.25, 0.15       # percepatan gempa saat kejadian dan ambang alarm [g]
+C_DOOR = 1.3                       # kapasitas aliran per pintu [orang/s] (asumsi)
+T_WALK = 40.0                      # waktu berjalan ke pintu terjauh [s] (asumsi 50 m, 1.2 m/s)
+N_DOORS = 9                        # jumlah pintu keluar darurat
+
+P_FAIL_AP, N_AP = 0.02, 5          # peluang gagal per AP dan jumlah AP
+
+# ============ 2. Parameter kolam ============
+POOLS = [
+    dict(name="Dangkal (anak)", As=60.0,  depth=0.8, Tsp=30.0, share=0.15),
+    dict(name="Hangat",         As=100.0, depth=1.2, Tsp=34.0, share=0.15),
+    dict(name="Dingin",         As=120.0, depth=1.6, Tsp=26.0, share=0.10),
+    dict(name="Latihan 25 m",   As=400.0, depth=3.1, Tsp=27.0, share=0.40),
+    dict(name="Loncat+Menara",  As=200.0, depth=3.5, Tsp=28.0, share=0.20),
+]
+POOL_COLS = ["C", "pH", "K", "Tw", "h", "Ph", "qm"]
+AIR_COLS = ["Ta", "phi", "mdot", "E", "lamp", "tirai", "N", "Ptot",
+            "Ts1", "Ts2", "fan", "sauna1", "sauna2"]
+
+
+# ============ 3. Kendali PID dengan anti-windup ============
+class PID:
+    def __init__(self, Kp, Ki, Kd, umin, umax):
+        self.Kp, self.Ki, self.Kd = Kp, Ki, Kd
+        self.umin, self.umax = umin, umax
+        self.I, self.e_prev = 0.0, 0.0
+
+    def step(self, e, dt):
+        de = (e - self.e_prev) / dt
+        self.e_prev = e
+        self.I += e * dt
+        u = self.Kp * e + self.Ki * self.I + self.Kd * de
+        us = min(max(u, self.umin), self.umax)
+        if us != u:                    # anti-windup: bekukan integrator saat jenuh
+            self.I -= e * dt
+        return us
+
+
+# ============ 4. Fungsi pendukung ============
+def hour_of_day(t):
+    return (t / 3600.0) % 24.0
+
+def psat(T):
+    """Tekanan uap jenuh [Pa], rumus Tetens."""
+    return 610.78 * math.exp(17.27 * T / (T + 237.3))
+
+def outdoor(t):
+    """Suhu udara luar [C] dan rasio kelembapan luar (kelembapan relatif 70%)."""
+    h = hour_of_day(t)
+    To = 29.0 + 3.0 * math.sin(2 * math.pi * (h - 9) / 24)
+    pv = 0.7 * psat(To)
+    return To, 0.622 * pv / (P_ATM - pv)
+
+def sun(t):
+    h = hour_of_day(t)
+    return E_SUN_PEAK * math.sin(math.pi * (h - 6) / 12) if 6 <= h <= 18 else 0.0
+
+def gate_open(t):
+    return 6 <= hour_of_day(t) < 22
+
+def arrivals(t):
+    if not gate_open(t):
+        return 0.0
+    h = hour_of_day(t)
+    return LAMBDA_BUSY if (9 <= h < 12 or 16 <= h < 19) else LAMBDA_OFF
+
+def backwash(t):
+    """Debit backwash filter per kolam [m3/s], aktif 02.00-02.10 setiap hari."""
+    h = hour_of_day(t)
+    return 0.005 if 2.0 <= h < 2.0 + 600 / 3600 else 0.0
+
+def quake_active(t):
+    t0 = ALARM_DAY * 86400 + ALARM_HOUR * 3600
+    return t0 <= t < t0 + ALARM_DUR
+
+
+# ============ 5. Simulasi loop tertutup ============
+def simulate():
+    alpha = 1.0 - math.exp(-DT / 30.0)     # lag aktuator pompa dosing (30 s)
+
+    pools = []
+    for p in POOLS:
+        V = p["As"] * p["depth"]
+        s = V / 1250.0                     # skala gain terhadap kolam referensi
+        pools.append(dict(
+            p=p, V=V,
+            C=1.0, pH=7.8, K=0.1, Tw=28.0, h=p["depth"],
+            qd=0.0, ph_act=0.0,
+            pidC=PID(2.5e-6 * s, 2e-10 * s, 0.0, 0.0, QD_MAX_REF * s),
+            pidpH=PID(1.0, 1e-3, 0.0, -1.0, 1.0),
+            pidT=PID(2e5 * s, 5.0 * s, 0.0, 0.0, PH_MAX_PER_M2 * p["As"]),
+            pidL=PID(1.2e-4 * p["As"], 4e-8 * p["As"], 0.0, 0.0, QM_MAX),
+            bC=deque([1.0] * L_DELAY, maxlen=L_DELAY),
+            bpH=deque([7.8] * L_DELAY, maxlen=L_DELAY),
+            bTw=deque([28.0] * L_DELAY, maxlen=L_DELAY),
+            bh=deque([p["depth"]] * L_DELAY, maxlen=L_DELAY),
+        ))
+
+    Ta, w, E, N = 29.0, 0.016, 200.0, 0.0
+    Ts = [30.0, 30.0]
+    sauna_on = [0, 0]
+    lamp, fan = 0, 0
+
+    LOG_P = np.zeros((N_STEPS, len(pools), len(POOL_COLS)))
+    LOG_A = np.zeros((N_STEPS, len(AIR_COLS)))
+
+    for k in range(N_STEPS):
+        t = k * DT
+        h_day = hour_of_day(t)
+        To, wo = outdoor(t)
+        pv = w * P_ATM / (0.622 + w)
+        phi = pv / psat(Ta)
+
+        # --- kontrol ventilasi (kipas, histeresis) ---
+        if fan == 0 and (Ta > 28.5 or phi > 0.70):
+            fan = 1
+        elif fan == 1 and (Ta < 27.5 and phi < 0.60):
+            fan = 0
+        mdot_v = MDOT_BASE + (MDOT_FAN if fan else 0.0)
+
+        # --- cahaya dan tirai ---
+        Esun = sun(t)
+        tirai = 1 if Esun > TIRAI_CLOSE else 0
+        if E < LAMP_ON:
+            lamp = 1
+        elif E > LAMP_OFF:
+            lamp = 0
+
+        # --- sauna (on/off dengan histeresis) ---
+        for i in range(2):
+            if not (6 <= h_day < 22):
+                sauna_on[i] = 0
+            elif Ts[i] < SAUNA_TMIN:
+                sauna_on[i] = 1
+            elif Ts[i] > SAUNA_TMAX:
+                sauna_on[i] = 0
+
+        # --- kolam: kendali dan dinamika ---
+        f_ev = F_EVAP_A + F_EVAP_B * V_WIND
+        qbw = backwash(t)
+        Q_pool, M_evap, P_heat = 0.0, 0.0, 0.0
+        derivs = []
+        for i, pst in enumerate(pools):
+            p = pst["p"]
+            V, As = pst["V"], p["As"]
+            n_i = N * p["share"]
+
+            # pembacaan sensor yang sudah terdelay
+            C_m, pH_m = pst["bC"][0], pst["bpH"][0]
+            Tw_m, h_m = pst["bTw"][0], pst["bh"][0]
+
+            u_qd = pst["pidC"].step(CSP - C_m, DT)
+            pst["qd"] += alpha * (u_qd - pst["qd"])
+            u_ph = pst["pidpH"].step(pH_m - PH_SP, DT)
+            pst["ph_act"] += alpha * (u_ph - pst["ph_act"])
+            Ph = pst["pidT"].step(p["Tsp"] - Tw_m, DT)
+            qm = pst["pidL"].step(p["depth"] - h_m, DT)
+
+            me = As * f_ev * max(psat(pst["Tw"]) - phi * psat(Ta), 0.0)
+            h0 = p["depth"] + 0.1
+
+            dC = pst["qd"] / V * CD - KR * pst["C"] - BETA * n_i - qm / V * pst["C"]
+            dpH = -KA * pst["ph_act"] - KPH * (pst["pH"] - PH0)
+            dK = SIGMA_K * n_i - K_FILTER * pst["K"] - qm / V * pst["K"]
+            dTw = (Ph - HC * As * (pst["Tw"] - Ta) - LV * me
+                   + RHO * CP * qm * (TM - pst["Tw"])) / (RHO * V * CP)
+            dh = (qm - qbw - CW * max(pst["h"] - h0, 0.0) ** 1.5 - me / RHO) / As
+            derivs.append((dC, dpH, dK, dTw, dh))
+
+            LOG_P[k, i] = [pst["C"], pst["pH"], pst["K"], pst["Tw"], pst["h"], Ph, qm]
+            Q_pool += HC * As * (pst["Tw"] - Ta)
+            M_evap += me
+            P_heat += Ph
+
+        for pst, (dC, dpH, dK, dTw, dh) in zip(pools, derivs):
+            pst["C"] = max(pst["C"] + DT * dC, 0.0)
+            pst["pH"] += DT * dpH
+            pst["K"] = max(pst["K"] + DT * dK, 0.0)
+            pst["Tw"] += DT * dTw
+            pst["h"] = max(pst["h"] + DT * dh, 0.0)
+            pst["bC"].append(pst["C"])
+            pst["bpH"].append(pst["pH"])
+            pst["bTw"].append(pst["Tw"])
+            pst["bh"].append(pst["h"])
+
+        # --- energi ---
+        P_sauna = P_S * (sauna_on[0] + sauna_on[1])
+        P_tot = (P_heat + P_PUMP + FAN_W * mdot_v
+                 + P_LAMP * lamp + P_sauna + P_CTRL)
+
+        LOG_A[k] = [Ta, phi, mdot_v, E, lamp, tirai, N, P_tot,
+                    Ts[0], Ts[1], fan, sauna_on[0], sauna_on[1]]
+
+        # --- udara, cahaya, sauna, hunian (Euler) ---
+        dTa = (mdot_v * CPA * (To - Ta) + Q_pool + ALPHA_P * N
+               + QL_FRAC * P_LAMP * lamp) / (M_AIR * CPA)
+        dw = (mdot_v * (wo - w) + M_evap) / M_AIR
+        dE = (-E + (1 - tirai) * TR * Esun + LAMP_LUX * lamp) / TAU_L
+        dTs = [(P_S * sauna_on[i] - UA_S * (Ts[i] - Ta)) / C_S for i in range(2)]
+        dN = arrivals(t) - N / TAU_STAY
+
+        Ta += DT * dTa
+        w += DT * dw
+        E += DT * dE
+        Ts = [Ts[i] + DT * dTs[i] for i in range(2)]
+        N = min(max(N + DT * dN, 0.0), float(N_MAX))
+
+    return LOG_P, LOG_A
+
+
+def evacuation_time(N0, n_open):
+    """Estimasi waktu evakuasi [s]: waktu berjalan ke pintu + waktu antrean."""
+    return T_WALK + N0 / (n_open * C_DOOR)
+
+
+# ============ 6. Jalankan dan tampilkan ============
+if __name__ == "__main__":
+    LP, LA = simulate()
+    assert np.isfinite(LP).all() and np.isfinite(LA).all(), "Simulasi tidak stabil"
+
+    steady = slice(2 * 1440, None)     # hari ke-3 sampai ke-7 (kondisi relatif stabil)
+    d_steady = 5.0
+    kwh = lambda x: x.sum() * DT / 3.6e6
+
+    print("=" * 72)
+    print("BLUEWAVE - HASIL SIMULASI 7 HARI (statistik hari ke-3 sampai ke-7)")
+    print("=" * 72)
+
+    print("\n[1] KOLAM: KUALITAS AIR, SUHU, LEVEL (sensor A, B, C)")
+    for i, p in enumerate(POOLS):
+        C = LP[steady, i, 0]; pH = LP[steady, i, 1]; K = LP[steady, i, 2]
+        Tw = LP[steady, i, 3]; h = LP[steady, i, 4]; Ph = LP[steady, i, 5]
+        qm = LP[steady, i, 6]
+        print(f"  {p['name']}")
+        print(f"    Klorin   : {C.min():.2f} - {C.max():.2f} mg/L (setpoint {CSP})")
+        print(f"    pH       : {pH.min():.2f} - {pH.max():.2f} (setpoint {PH_SP})")
+        print(f"    Kekeruhan: maks {K.max():.2f} NTU")
+        print(f"    Suhu air : {Tw.min():.2f} - {Tw.max():.2f} C (setpoint {p['Tsp']})")
+        print(f"    Level    : {h.min():.3f} - {h.max():.3f} m (setpoint {p['depth']})")
+        print(f"    Air segar: {qm.sum() * DT / d_steady:.2f} m3/hari")
+        print(f"    Pemanas  : {kwh(Ph) / d_steady:.1f} kWh/hari")
+
+    print("\n[2] UDARA INDOOR, CAHAYA, SAUNA (sensor D, L, T)")
+    Ta = LA[steady, 0]; phi = LA[steady, 1]
+    print(f"  Suhu udara      : {Ta.min():.2f} - {Ta.max():.2f} C")
+    print(f"  Kelembapan rel. : {phi.min() * 100:.0f} - {phi.max() * 100:.0f} %")
+    print(f"  Kipas aktif     : {LA[steady, 10].sum() * DT / 3600 / d_steady:.1f} jam/hari")
+    print(f"  Lampu menyala   : {LA[steady, 4].sum() * DT / 3600 / d_steady:.1f} jam/hari")
+    print(f"  Tirai tertutup  : {LA[steady, 5].sum() * DT / 3600 / d_steady:.1f} jam/hari")
+    print(f"  Cahaya ruangan  : {LA[steady, 3].min():.0f} - {LA[steady, 3].max():.0f} lux")
+    for j, name in enumerate(["Sauna 1", "Sauna 2"]):
+        on = LA[steady, 11 + j].sum() * DT / 3600 / d_steady
+        print(f"  {name:<16}: aktif {on:.1f} jam/hari, suhu maks {LA[:, 8 + j].max():.1f} C")
+
+    print("\n[3] HUNIAN DAN GERBANG (sensor E, F, G)")
+    N = LA[:, 6]
+    k_max = int(np.argmax(N))
+    print(f"  Jumlah orang maks : {N.max():.0f} orang pada hari ke-{k_max * DT / 86400:.2f}")
+    hours = (np.arange(N_STEPS) * DT / 3600.0) % 24.0
+    print(f"  Rata-rata siang   : {N[hours >= 9].mean():.0f} orang")
+
+    print("\n[4] ENERGI (meter M)")
+    P_tot = LA[:, 7]
+    print(f"  Rata-rata daya    : {P_tot.mean() / 1000:.1f} kW")
+    print(f"  Energi per hari   : {kwh(P_tot) / DAYS:.1f} kWh")
+    print(f"  Energi 7 hari     : {kwh(P_tot):.1f} kWh")
+
+    print("\n[5] KESELAMATAN: GEMPA DAN EVAKUASI (sensor Q, G; aktuator S, X)")
+    k0 = int(ALARM_DAY * 86400 / DT + ALARM_HOUR * 3600 / DT)
+    alarm_steps = sum(1 for k in range(N_STEPS) if quake_active(k * DT))
+    N0 = LA[k0, 6]
+    print(f"  Percepatan gempa  : {AG_EVENT} g > ambang {AG_TH} g -> alarm = 1")
+    print(f"  Alarm aktif       : {alarm_steps * DT:.0f} s, sirene dan pintu darurat menyala")
+    print(f"  Orang saat alarm  : {N0:.0f} orang")
+    for n_open in (N_DOORS, 8, 6):
+        print(f"  Evakuasi {n_open} pintu terbuka: {evacuation_time(N0, n_open):.1f} s "
+              f"(termasuk {T_WALK:.0f} s berjalan ke pintu)")
+
+    print("\n[6] JARINGAN (sensor W, controller H)")
+    print(f"  Tunda sensor-controller : {DELAY:.0f} s")
+    p_avail = 1.0 - P_FAIL_AP ** N_AP
+    print(f"  Ketersediaan jaringan   : {p_avail * 100:.8f} % (dengan {N_AP} AP, p_gagal {P_FAIL_AP})")
+
+    print("\nSimulasi selesai.")
