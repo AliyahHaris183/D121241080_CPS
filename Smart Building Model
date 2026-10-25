@@ -8,7 +8,8 @@ Cakupan:
   Hunian          : jumlah orang dan gerbang (E, F, G)
   Keselamatan     : alarm gempa, sirene, pintu darurat (Q, G, S, X)
   Energi          : meter daya dan energi (M)
-  Jaringan        : tunda sensor dan ketersediaan Wi-Fi 6 (W, H)
+  Jaringan        : pembacaan sensor bisa hilang dengan peluang PKT_LOSS per langkah.
+    Controller memakai nilai terakhir yang diterima; ketersediaan Wi-Fi 6 (W, H)
 Metode : Euler, dt = 60 s, simulasi 7 hari
 Catatan: parameter adalah contoh (bukan hasil kalibrasi terhadap data sensor).
 """
@@ -24,6 +25,7 @@ N_STEPS = DAYS * 86400 // int(DT)  # jumlah langkah
 DELAY = 120.0                      # tunda sensor + jaringan [s]
 L_DELAY = int(DELAY / DT)          # panjang buffer tunda (langkah)
 P_ATM = 101325.0                   # tekanan atmosfer [Pa]
+SEED = 42                          # seed acak agar hasil bisa diulang
 
 RHO, CP, LV = 1000.0, 4180.0, 2.45e6   # air: massa jenis, kalor jenis, kalor laten [SI]
 HC = 10.0                          # koefisien perpindahan panas permukaan [W/m2/K]
@@ -69,14 +71,20 @@ N_MAX = 200                        # kapasitas maksimum area kolam [orang]
 
 P_PUMP, P_CTRL = 4000.0, 500.0     # daya pompa sirkulasi dan controller [W]
 
-ALARM_DAY, ALARM_HOUR = 3, 10.0    # skenario gempa: hari ke-3 pukul 10.00
-ALARM_DUR = 60.0                   # durasi getaran [s]
-AG_EVENT, AG_TH = 0.25, 0.15       # percepatan gempa saat kejadian dan ambang alarm [g]
+# ---- Keselamatan: skenario kejadian ----
+ALARM_DUR = 60.0                   # durasi minimum sirene setelah kejadian [s]
+AG_TH = 0.15                       # ambang percepatan gempa [g]
+H_TH = 0.20                        # ambang tinggi banjir [m]
+QUAKE = dict(day=3, hour=10.0, dur=60.0, ag=0.25)          # gempa
+FLOOD = dict(day=6, hour=8.0, dur=1800.0, h=0.30)          # banjir 30 menit
+BUTTON = dict(day=5, hour=16.0, dur=30.0)                  # tombol G ditekan (palsu)
 C_DOOR = 1.3                       # kapasitas aliran per pintu [orang/s] (asumsi)
 T_WALK = 40.0                      # waktu berjalan ke pintu terjauh [s] (asumsi 50 m, 1.2 m/s)
 N_DOORS = 9                        # jumlah pintu keluar darurat
 
-P_FAIL_AP, N_AP = 0.02, 5          # peluang gagal per AP dan jumlah AP
+# ---- Jaringan ----
+P_FAIL_AP, N_AP = 0.02, 5          # peluang gagal per AP dan jumlah AP (analitik)
+PKT_LOSS = 0.05                    # peluang pembacaan sensor hilang per langkah (skenario jaringan)
 
 # ============ 2. Parameter kolam ============
 POOLS = [
@@ -88,7 +96,7 @@ POOLS = [
 ]
 POOL_COLS = ["C", "pH", "K", "Tw", "h", "Ph", "qm"]
 AIR_COLS = ["Ta", "phi", "mdot", "E", "lamp", "tirai", "N", "Ptot",
-            "Ts1", "Ts2", "fan", "sauna1", "sauna2"]
+            "Ts1", "Ts2", "fan", "sauna1", "sauna2", "alarm"]
 
 
 # ============ 3. Kendali PID dengan anti-windup ============
@@ -142,14 +150,35 @@ def backwash(t):
     h = hour_of_day(t)
     return 0.005 if 2.0 <= h < 2.0 + 600 / 3600 else 0.0
 
-def quake_active(t):
-    t0 = ALARM_DAY * 86400 + ALARM_HOUR * 3600
-    return t0 <= t < t0 + ALARM_DUR
+def in_window(t, day, hour, dur):
+    t0 = day * 86400 + hour * 3600
+    return t0 <= t < t0 + dur
+
+def quake_ag(t):
+    return QUAKE["ag"] if in_window(t, QUAKE["day"], QUAKE["hour"], QUAKE["dur"]) else 0.0
+
+def flood_h(t):
+    return FLOOD["h"] if in_window(t, FLOOD["day"], FLOOD["hour"], FLOOD["dur"]) else 0.0
+
+def button_on(t):
+    return in_window(t, BUTTON["day"], BUTTON["hour"], BUTTON["dur"])
+
+def clock(t):
+    """Format waktu sebagai hari ke-N (mulai 1) pukul HH:MM."""
+    day = int(t // 86400) + 1
+    hh = int((t % 86400) // 3600)
+    mm = int((t % 3600) // 60)
+    return f"hari ke-{day} pukul {hh:02d}:{mm:02d}"
 
 
 # ============ 5. Simulasi loop tertutup ============
-def simulate():
+def simulate(n_blocked=0, loss=False):
+    """
+    n_blocked : jumlah pintu darurat yang terhalang (tidak bisa dipakai)
+    loss      : True jika pembacaan sensor boleh hilang (skenario jaringan)
+    """
     alpha = 1.0 - math.exp(-DT / 30.0)     # lag aktuator pompa dosing (30 s)
+    rng = np.random.default_rng(SEED)
 
     pools = []
     for p in POOLS:
@@ -167,12 +196,25 @@ def simulate():
             bpH=deque([7.8] * L_DELAY, maxlen=L_DELAY),
             bTw=deque([28.0] * L_DELAY, maxlen=L_DELAY),
             bh=deque([p["depth"]] * L_DELAY, maxlen=L_DELAY),
+            # nilai terakhir yang diterima controller (dipakai saat paket hilang)
+            gC=1.0, gpH=7.8, gTw=28.0, gh=p["depth"],
         ))
 
     Ta, w, E, N = 29.0, 0.016, 200.0, 0.0
     Ts = [30.0, 30.0]
     sauna_on = [0, 0]
     lamp, fan = 0, 0
+
+    # keselamatan
+    alarm_latch, t_onset = False, -1e9
+    prev_q = prev_f = prev_b = False
+    kind_now = "-"
+    episodes = []
+    n_open_doors = N_DOORS - n_blocked
+    evacuated = 0.0
+    alarm_steps = 0
+
+    lost = 0
 
     LOG_P = np.zeros((N_STEPS, len(pools), len(POOL_COLS)))
     LOG_A = np.zeros((N_STEPS, len(AIR_COLS)))
@@ -183,6 +225,23 @@ def simulate():
         To, wo = outdoor(t)
         pv = w * P_ATM / (0.622 + w)
         phi = pv / psat(Ta)
+
+        # --- keselamatan: alarm dari ambang, dengan penahan minimum ---
+        cond_q = quake_ag(t) > AG_TH
+        cond_f = flood_h(t) > H_TH
+        cond_b = button_on(t)
+        trig = (cond_q and not prev_q) or (cond_f and not prev_f) or (cond_b and not prev_b)
+        prev_q, prev_f, prev_b = cond_q, cond_f, cond_b      # picu hanya saat kejadian mulai
+        if trig and not alarm_latch:
+            alarm_latch = True
+            kind_now = "gempa" if cond_q else ("banjir" if cond_f else "tombol G")
+            episodes.append(dict(t=t, kind=kind_now, N0=N, t_ev=None))
+            t_onset = t
+        alarm = 1 if alarm_latch else 0      # sirene tetap menyala sampai area kosong
+        if alarm:
+            alarm_steps += 1
+        evac_ok = bool(alarm) and (t - t_onset >= T_WALK)
+        n_open = n_open_doors if alarm else 0
 
         # --- kontrol ventilasi (kipas, histeresis) ---
         if fan == 0 and (Ta > 28.5 or phi > 0.70):
@@ -218,9 +277,16 @@ def simulate():
             V, As = pst["V"], p["As"]
             n_i = N * p["share"]
 
-            # pembacaan sensor yang sudah terdelay
-            C_m, pH_m = pst["bC"][0], pst["bpH"][0]
-            Tw_m, h_m = pst["bTw"][0], pst["bh"][0]
+            # jaringan: pembacaan bisa hilang, controller memakai nilai terakhir
+            ok = (rng.random() > PKT_LOSS) if loss else True
+            if ok:
+                C_m, pH_m = pst["bC"][0], pst["bpH"][0]
+                Tw_m, h_m = pst["bTw"][0], pst["bh"][0]
+                pst["gC"], pst["gpH"], pst["gTw"], pst["gh"] = C_m, pH_m, Tw_m, h_m
+            else:
+                lost += 1
+                C_m, pH_m = pst["gC"], pst["gpH"]
+                Tw_m, h_m = pst["gTw"], pst["gh"]
 
             u_qd = pst["pidC"].step(CSP - C_m, DT)
             pst["qd"] += alpha * (u_qd - pst["qd"])
@@ -262,7 +328,7 @@ def simulate():
                  + P_LAMP * lamp + P_sauna + P_CTRL)
 
         LOG_A[k] = [Ta, phi, mdot_v, E, lamp, tirai, N, P_tot,
-                    Ts[0], Ts[1], fan, sauna_on[0], sauna_on[1]]
+                    Ts[0], Ts[1], fan, sauna_on[0], sauna_on[1], alarm]
 
         # --- udara, cahaya, sauna, hunian (Euler) ---
         dTa = (mdot_v * CPA * (To - Ta) + Q_pool + ALPHA_P * N
@@ -270,25 +336,43 @@ def simulate():
         dw = (mdot_v * (wo - w) + M_evap) / M_AIR
         dE = (-E + (1 - tirai) * TR * Esun + LAMP_LUX * lamp) / TAU_L
         dTs = [(P_S * sauna_on[i] - UA_S * (Ts[i] - Ta)) / C_S for i in range(2)]
-        dN = arrivals(t) - N / TAU_STAY
+        arr = 0.0 if alarm else arrivals(t)     # gerbang tutup saat alarm
+        dN = arr - N / TAU_STAY
+        out, clear_at = 0.0, None
+        if alarm:                                  # orang keluar per detik setelah waktu berjalan
+            for sec in range(0, int(DT)):
+                if t + sec - t_onset < T_WALK:
+                    continue
+                out += min(max(N - out, 0.0), n_open * C_DOOR)
+                if N - out < 1.0:
+                    clear_at = sec + 1
+                    break
 
         Ta += DT * dTa
         w += DT * dw
         E += DT * dE
         Ts = [Ts[i] + DT * dTs[i] for i in range(2)]
-        N = min(max(N + DT * dN, 0.0), float(N_MAX))
+        N = min(max(N + DT * dN - out, 0.0), float(N_MAX))
+        evacuated += out
 
-    return LOG_P, LOG_A
+        for ep in episodes:
+            if ep["t_ev"] is None and clear_at is not None and t >= ep["t"]:
+                ep["t_ev"] = t - ep["t"] + clear_at
+        if alarm_latch and N < 1.0 and t - t_onset >= T_WALK:
+            alarm_latch = False                # area kosong: alarm dinonaktifkan
+
+    info = dict(episodes=episodes, lost=lost, evacuated=evacuated,
+                alarm_s=alarm_steps * DT, n_steps=N_STEPS, n_pools=len(pools))
+    return LOG_P, LOG_A, info
 
 
-def evacuation_time(N0, n_open):
-    """Estimasi waktu evakuasi [s]: waktu berjalan ke pintu + waktu antrean."""
-    return T_WALK + N0 / (n_open * C_DOOR)
+def fmt_s(x):
+    return "belum selesai" if x is None else f"{x:.0f} detik"
 
 
 # ============ 6. Jalankan dan tampilkan ============
 if __name__ == "__main__":
-    LP, LA = simulate()
+    LP, LA, info = simulate()
     assert np.isfinite(LP).all() and np.isfinite(LA).all(), "Simulasi tidak stabil"
 
     steady = slice(2 * 1440, None)     # hari ke-3 sampai ke-7 (kondisi relatif stabil)
@@ -328,7 +412,7 @@ if __name__ == "__main__":
     print("\n[3] HUNIAN DAN GERBANG (sensor E, F, G)")
     N = LA[:, 6]
     k_max = int(np.argmax(N))
-    print(f"  Jumlah orang maks : {N.max():.0f} orang pada hari ke-{k_max * DT / 86400:.2f}")
+    print(f"  Jumlah orang maks : {N.max():.0f} orang pada {clock(k_max * DT)}")
     hours = (np.arange(N_STEPS) * DT / 3600.0) % 24.0
     print(f"  Rata-rata siang   : {N[hours >= 9].mean():.0f} orang")
 
@@ -338,20 +422,37 @@ if __name__ == "__main__":
     print(f"  Energi per hari   : {kwh(P_tot) / DAYS:.1f} kWh")
     print(f"  Energi 7 hari     : {kwh(P_tot):.1f} kWh")
 
-    print("\n[5] KESELAMATAN: GEMPA DAN EVAKUASI (sensor Q, G; aktuator S, X)")
-    k0 = int(ALARM_DAY * 86400 / DT + ALARM_HOUR * 3600 / DT)
-    alarm_steps = sum(1 for k in range(N_STEPS) if quake_active(k * DT))
-    N0 = LA[k0, 6]
-    print(f"  Percepatan gempa  : {AG_EVENT} g > ambang {AG_TH} g -> alarm = 1")
-    print(f"  Alarm aktif       : {alarm_steps * DT:.0f} s, sirene dan pintu darurat menyala")
-    print(f"  Orang saat alarm  : {N0:.0f} orang")
-    for n_open in (N_DOORS, 8, 6):
-        print(f"  Evakuasi {n_open} pintu terbuka: {evacuation_time(N0, n_open):.1f} s "
-              f"(termasuk {T_WALK:.0f} s berjalan ke pintu)")
+    print("\n[5] KESELAMATAN (sensor Q, G; aktuator S, X)")
+    print(f"  Ambang: gempa a_g > {AG_TH} g, banjir h > {H_TH} m, tombol G ditekan")
+    print(f"  Total waktu alarm aktif : {info['alarm_s']:.0f} detik")
+    print(f"  Total orang keluar      : {info['evacuated']:.0f} orang")
+    for ep in info["episodes"]:
+        print(f"  Alarm {ep['kind']:<9} {clock(ep['t'])}, orang di area: {ep['N0']:.0f}, "
+              f"waktu sampai area kosong: {fmt_s(ep['t_ev'])}")
 
     print("\n[6] JARINGAN (sensor W, controller H)")
     print(f"  Tunda sensor-controller : {DELAY:.0f} s")
     p_avail = 1.0 - P_FAIL_AP ** N_AP
-    print(f"  Ketersediaan jaringan   : {p_avail * 100:.8f} % (dengan {N_AP} AP, p_gagal {P_FAIL_AP})")
+    print(f"  Ketersediaan (analitik) : {p_avail * 100:.8f} % (dengan {N_AP} AP, p_gagal {P_FAIL_AP})")
+
+    print("\n[7] SKENARIO PINTU DAN JARINGAN")
+    LP_b, LA_b, info_b = simulate(n_blocked=8)
+    print("  Skenario 8 pintu terhalang (hanya 1 pintu terbuka):")
+    for ep in info_b["episodes"]:
+        print(f"    Alarm {ep['kind']:<9} {clock(ep['t'])}, orang: {ep['N0']:.0f}, "
+              f"waktu sampai area kosong: {fmt_s(ep['t_ev'])}")
+
+    LP_l, LA_l, info_l = simulate(loss=True)
+    print(f"  Skenario jaringan, paket hilang {PKT_LOSS * 100:.0f}% per langkah:")
+    print(f"    Pembacaan hilang : {info_l['lost']} dari {N_STEPS * len(POOLS)} "
+          f"({100 * info_l['lost'] / (N_STEPS * len(POOLS)):.1f}%)")
+    C_base = LP[steady, :, 0]; C_loss = LP_l[steady, :, 0]
+    Tw_base = LP[steady, :, 3]; Tw_loss = LP_l[steady, :, 3]
+    print(f"    Klorin, tanpa hilang : {C_base.min():.2f} - {C_base.max():.2f} mg/L")
+    print(f"    Klorin, dengan hilang: {C_loss.min():.2f} - {C_loss.max():.2f} mg/L")
+    print(f"    Suhu air tanpa hilang: {Tw_base.min():.2f} - {Tw_base.max():.2f} C")
+    print(f"    Suhu air dengan hilang: {Tw_loss.min():.2f} - {Tw_loss.max():.2f} C")
+    print(f"    Selisih maks klorin   : {np.max(np.abs(C_base - C_loss)):.4f} mg/L")
+    print(f"    Selisih maks suhu air : {np.max(np.abs(Tw_base - Tw_loss)):.4f} C")
 
     print("\nSimulasi selesai.")
